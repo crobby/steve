@@ -963,11 +963,12 @@ func Test_formatterLinks(t *testing.T) {
 			},
 			currentLinks: map[string]string{
 				"default": "defaultVal",
+				"patch":   "/v1/apps.deployments/example-ns/example-deployment",
 				"view":    "/apis/apps/v1/namespaces/example-ns/deployments/example-deployment",
 			},
 			wantLinks: map[string]string{
 				"default": "defaultVal",
-				"patch":   "/apis/apps/v1/namespaces/example-ns/deployments/example-deployment",
+				"patch":   "/v1/apps.deployments/example-ns/example-deployment",
 				"view":    "/apis/apps/v1/namespaces/example-ns/deployments/example-deployment",
 			},
 		},
@@ -1001,6 +1002,7 @@ func Test_formatterLinks(t *testing.T) {
 			},
 			currentLinks: map[string]string{
 				"default": "defaultVal",
+				"patch":   "/v1/apps.deployments/example-ns/example-deployment",
 				"view":    "/apis/apps/v1/namespaces/example-ns/deployments/example-deployment",
 			},
 			wantLinks: map[string]string{

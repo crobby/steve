@@ -122,8 +122,6 @@ func formatter(summarycache *summarycache.SummaryCache, asl accesscontrol.Access
 		if hasPatch {
 			if attributes.DisallowMethods(resource.Schema)[http.MethodPatch] {
 				resource.Links["patch"] = "blocked"
-			} else {
-				resource.Links["patch"] = u
 			}
 		} else {
 			delete(resource.Links, "patch")
