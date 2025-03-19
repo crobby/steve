@@ -4,6 +4,7 @@ package schema
 import (
 	"context"
 	"fmt"
+	"github.com/rancher/lasso/pkg/log"
 	"net/http"
 	"time"
 
@@ -45,7 +46,8 @@ func (c *Collection) Schemas(user user.Info) (*types.APISchemas, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.addToCache(access, user, schemas)
+	// Removing caching for testing purposes
+	//c.addToCache(access, user, schemas)
 	return schemas, nil
 }
 
@@ -86,6 +88,8 @@ func (c *Collection) schemasForSubject(access *accesscontrol.AccessSet) (*types.
 		return nil, err
 	}
 
+	allowedVerbs := []string{"get", "list", "create", "update", "delete"}
+
 	for _, s := range c.schemas {
 		gr := attributes.GR(s)
 
@@ -96,74 +100,49 @@ func (c *Collection) schemasForSubject(access *accesscontrol.AccessSet) (*types.
 			continue
 		}
 
-		verbs := attributes.Verbs(s)
 		verbAccess := accesscontrol.AccessListByVerb{}
+		hasAccess := false
+		namespaceVerbs := map[string][]string{} // map to store verbs per namespace
 
-		for _, verb := range verbs {
-			a := access.AccessListFor(verb, gr)
-			if !attributes.Namespaced(s) {
-				// trim out bad data where we are granted namespaced access to cluster scoped object
-				result := accesscontrol.AccessList{}
-				for _, access := range a {
-					if access.Namespace == accesscontrol.All {
-						result = append(result, access)
-					}
-				}
-				a = result
-			}
-			if len(a) > 0 {
-				verbAccess[verb] = a
-			}
-		}
-
-		if len(verbAccess) == 0 {
-			if gr.Group == "" && gr.Resource == "namespaces" {
-				var accessList accesscontrol.AccessList
-				for _, ns := range access.Namespaces() {
-					accessList = append(accessList, accesscontrol.Access{
-						Namespace:    accesscontrol.All,
-						ResourceName: ns,
-					})
-				}
-				verbAccess["get"] = accessList
-				verbAccess["watch"] = accessList
-				if len(accessList) == 0 {
-					// always allow list
-					s.CollectionMethods = append(s.CollectionMethods, http.MethodGet)
+		for _, verb := range allowedVerbs {
+			accessList := access.AccessListFor(verb, gr)
+			for _, entry := range accessList {
+				if access.HasNamespace(entry.Namespace) { // check if the namespace is allowed
+					verbAccess[verb] = append(verbAccess[verb], entry)
+					log.Infof("Adding verb: %s to namespace %s", verb, entry.Namespace)
+					namespaceVerbs[entry.Namespace] = append(namespaceVerbs[entry.Namespace], verb)
+					hasAccess = true
 				}
 			}
 		}
 
-		allowed := func(method string) string {
-			if attributes.DisallowMethods(s)[method] {
-				return "blocked-" + method
-			}
-			return method
+		if !hasAccess {
+			continue
 		}
 
 		s = s.DeepCopy()
 		attributes.SetAccess(s, verbAccess)
+
+		// Add resource methods based on verb access
 		if verbAccess.AnyVerb("list", "get") {
-			s.ResourceMethods = append(s.ResourceMethods, allowed(http.MethodGet))
-			s.CollectionMethods = append(s.CollectionMethods, allowed(http.MethodGet))
+			s.ResourceMethods = append(s.ResourceMethods, http.MethodGet)
+			s.CollectionMethods = append(s.CollectionMethods, http.MethodGet)
 		}
 		if verbAccess.AnyVerb("delete") {
-			s.ResourceMethods = append(s.ResourceMethods, allowed(http.MethodDelete))
+			s.ResourceMethods = append(s.ResourceMethods, http.MethodDelete)
 		}
 		if verbAccess.AnyVerb("update") {
-			s.ResourceMethods = append(s.ResourceMethods, allowed(http.MethodPut))
-			s.ResourceMethods = append(s.ResourceMethods, allowed(http.MethodPatch))
+			s.ResourceMethods = append(s.ResourceMethods, http.MethodPut, http.MethodPatch)
 		}
 		if verbAccess.AnyVerb("create") {
-			s.CollectionMethods = append(s.CollectionMethods, allowed(http.MethodPost))
+			s.CollectionMethods = append(s.CollectionMethods, http.MethodPost)
 		}
 		if verbAccess.AnyVerb("patch") {
-			s.ResourceMethods = append(s.ResourceMethods, allowed(http.MethodPatch))
+			s.ResourceMethods = append(s.ResourceMethods, http.MethodPatch)
 		}
 
-		if len(s.CollectionMethods) == 0 && len(s.ResourceMethods) == 0 {
-			continue
-		}
+		// Add namespace-specific verb access data
+		s.Attributes["namespaceVerbs"] = namespaceVerbs
 
 		if err := result.AddSchema(*s); err != nil {
 			return nil, err
@@ -173,6 +152,7 @@ func (c *Collection) schemasForSubject(access *accesscontrol.AccessSet) (*types.
 	result.Attributes = map[string]interface{}{
 		"accessSet": access,
 	}
+
 	return result, nil
 }
 

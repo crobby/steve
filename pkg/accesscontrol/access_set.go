@@ -100,6 +100,15 @@ func (a AccessSet) Grants(verb string, gr schema.GroupResource, namespace, name 
 	return false
 }
 
+func (a *AccessSet) HasNamespace(ns string) bool {
+	for _, namespace := range a.Namespaces() {
+		if namespace == ns {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *AccessSet) GrantsNonResource(verb, url string) bool {
 	if a.nonResourceSet == nil {
 		return false
@@ -273,4 +282,21 @@ func GetAccessListMap(s *types.APISchema) AccessListByVerb {
 	}
 	v, _ := attributes.Access(s).(AccessListByVerb)
 	return v
+}
+
+func (a AccessList) Namespaces() []string {
+	set := map[string]bool{}
+	for _, access := range a {
+		if access.Namespace == All {
+			continue
+		}
+		set[access.Namespace] = true
+	}
+
+	var result []string
+	for ns := range set {
+		result = append(result, ns)
+	}
+	sort.Strings(result)
+	return result
 }
