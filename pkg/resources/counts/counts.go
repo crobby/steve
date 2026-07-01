@@ -1,9 +1,11 @@
 package counts
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/rancher/apiserver/pkg/store/empty"
 	"github.com/rancher/apiserver/pkg/types"
@@ -12,6 +14,7 @@ import (
 	"github.com/rancher/steve/pkg/clustercache"
 	"github.com/rancher/wrangler/v3/pkg/schemas"
 	"github.com/rancher/wrangler/v3/pkg/summary"
+	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	schema2 "k8s.io/apimachinery/pkg/runtime/schema"
@@ -24,6 +27,10 @@ var (
 		"apiRoot": true,
 	}
 )
+
+// nonWatchablePollInterval is how often the Watch stream re-lists resources
+// that do not support the watch verb (e.g. aggregated-API action resources).
+const nonWatchablePollInterval = 30 * time.Second
 
 // Register registers a new count schema. This schema isn't a true resource but instead returns counts for other resources
 func Register(schemas *types.APISchemas, ccache clustercache.ClusterCache) {
@@ -203,6 +210,47 @@ func (s *Store) Watch(apiOp *types.APIRequest, schema *types.APISchema, w types.
 		return onChange(false, gvk, key, obj, nil)
 	})
 
+	// For resources that don't support the watch verb the ClusterCache has no
+	// informer, so onChange will never fire for them.  Poll their store
+	// directly so the Watch stream stays live for non-watchable schemas too.
+	for id := range counts {
+		pollSchema := apiOp.Schemas.LookupSchema(id)
+		if pollSchema == nil || hasListAndWatch(pollSchema) {
+			continue // ClusterCache handles these via onChange above
+		}
+		pollID := id
+		go func() {
+			ticker := time.NewTicker(nonWatchablePollInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					newItemCount, err := s.listFromStore(apiOp, pollSchema)
+					if err != nil {
+						logrus.Debugf("counts: poll list failed for %s: %v", pollID, err)
+						continue
+					}
+					countLock.Lock()
+					if result == nil {
+						countLock.Unlock()
+						return
+					}
+					prev := counts[pollID]
+					if newItemCount.Summary.Count != prev.Summary.Count {
+						counts[pollID] = newItemCount
+						result <- Count{
+							ID:     "count",
+							Counts: map[string]ItemCount{pollID: *newItemCount.DeepCopy()},
+						}
+					}
+					countLock.Unlock()
+				case <-apiOp.Context().Done():
+					return
+				}
+			}
+		}()
+	}
+
 	// buffer the counts so that we don't spam the consumer with constant updates
 	return countsBuffer(result), nil
 }
@@ -229,6 +277,68 @@ func (s *Store) schemasToWatch(apiOp *types.APIRequest) (result []*types.APISche
 	}
 
 	return
+}
+
+// hasListAndWatch reports whether the schema's resource advertises both the
+// "list" and "watch" verbs, which are required for cluster-cache informers.
+// Resources that lack watch (e.g. some aggregated-API action resources) have
+// no informer; their counts are obtained via listFromStore fallback instead.
+func hasListAndWatch(schema *types.APISchema) bool {
+	canList, canWatch := false, false
+	for _, verb := range attributes.Verbs(schema) {
+		switch verb {
+		case "list":
+			canList = true
+		case "watch":
+			canWatch = true
+		}
+	}
+	return canList && canWatch
+}
+
+// listFromStore lists all objects for the schema via its Store and returns
+// an ItemCount with per-namespace totals.  It is used as a fallback for
+// resources whose API does not support the watch verb (and therefore have no
+// ClusterCache informer backing them).  Summary state (error/transitioning)
+// is not available through this path and is left as zero.
+func (s *Store) listFromStore(apiOp *types.APIRequest, schema *types.APISchema) (ItemCount, error) {
+	itemCount := ItemCount{Namespaces: map[string]Summary{}}
+	if schema.Store == nil {
+		return itemCount, nil
+	}
+
+	// Shallow-copy the request, overriding Namespace so we list across all
+	// namespaces regardless of whatever namespace the caller targeted.
+	listOp := *apiOp
+	listOp.Namespace = ""
+
+	result, err := schema.Store.List(&listOp, schema)
+	if err != nil {
+		return itemCount, fmt.Errorf("listing %s for counts: %w", schema.ID, err)
+	}
+
+	for _, obj := range result.Objects {
+		ns := namespaceFromObject(obj)
+		itemCount = addCounts(itemCount, ns, summary.Summary{})
+	}
+	return itemCount, nil
+}
+
+// namespaceFromObject extracts the namespace from a types.APIObject by
+// inspecting its underlying runtime.Object via the meta accessor.
+func namespaceFromObject(obj types.APIObject) string {
+	if obj.Object == nil {
+		return ""
+	}
+	r, ok := obj.Object.(runtime.Object)
+	if !ok {
+		return ""
+	}
+	m, err := meta.Accessor(r)
+	if err != nil {
+		return ""
+	}
+	return m.GetNamespace()
 }
 
 func getInfo(obj interface{}, schema *types.APISchema) (name string, namespace string, revision int, summaryResult summary.Summary, ok bool) {
@@ -327,9 +437,22 @@ func (s *Store) getCount(apiOp *types.APIRequest) Count {
 			Namespaces: map[string]Summary{},
 		}
 
+		objs := s.ccache.List(gvk)
+		if objs == nil {
+			// No cluster-cache informer for this GVK: the resource does not
+			// advertise the watch verb so validSchema() skipped it.  Fall back
+			// to the schema's own Store so we still return an accurate count.
+			if ic, err := s.listFromStore(apiOp, schema); err == nil {
+				counts[schema.ID] = ic
+			} else {
+				logrus.Debugf("counts: store fallback failed for %s: %v", schema.ID, err)
+			}
+			continue
+		}
+
 		all := access.Grants("list", "*", "*")
 
-		for _, obj := range s.ccache.List(gvk) {
+		for _, obj := range objs {
 			name, ns, revision, summary, ok := getInfo(obj, schema)
 			if !ok {
 				continue
