@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/suite"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	certutil "k8s.io/client-go/util/cert"
@@ -210,6 +211,15 @@ func (s *ExtensionAPIServerSuite) SetupSuite() {
 
 	s.client, err = kubernetes.NewForConfig(s.restConfig)
 	s.Require().NoError(err)
+
+	// The kube-apiserver creates the extension-apiserver-authentication
+	// configmap asynchronously after startup. The authenticators' RunOnce()
+	// silently skips a missing configmap, which leaves them unconfigured
+	// (401s) if a test runs before it exists.
+	s.Require().Eventually(func() bool {
+		_, err := s.client.CoreV1().ConfigMaps(authenticationConfigMapNamespace).Get(context.Background(), authenticationConfigMapName, metav1.GetOptions{})
+		return err == nil
+	}, 30*time.Second, 100*time.Millisecond, "extension-apiserver-authentication configmap not created")
 
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 }
